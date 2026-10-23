@@ -50,6 +50,14 @@ GRAPH = "https://graph.microsoft.com/v1.0"
 GRAPH_HOST = "graph.microsoft.com"
 INBOX_MESSAGES = "/me/mailFolders/inbox/messages"
 INBOX_MESSAGES_PATH = "/v1.0" + INBOX_MESSAGES
+# Graph writes the same listing differently in the @odata.nextLink it returns:
+# mailFolders('inbox') instead of mailFolders/inbox (seen live on Exchange
+# Online). Both name the signed-in user's own inbox under /me; nothing else
+# is accepted.
+INBOX_NEXT_LINK_PATHS = frozenset((
+    INBOX_MESSAGES_PATH.lower(),
+    "/v1.0/me/mailFolders('inbox')/messages".lower(),
+))
 # Inbox pages read per cycle (limit messages each). More than this and the
 # read fails, and sending is held, rather than acting on a partial inbox.
 MAX_INBOX_PAGES = 40
@@ -375,8 +383,9 @@ class MicrosoftProvider(MailProvider):
 def _checked_next_link(link) -> str:
     """Graph's @odata.nextLink, used whole (Microsoft: don't rebuild or
     edit $skip). It gets the bearer token, so it must point back at the
-    inbox listing on Graph itself: https, graph.microsoft.com, the same
-    path, no credentials, no fragment. Anything else raises GraphError."""
+    inbox listing on Graph itself: https, graph.microsoft.com, the inbox
+    path (in either of Graph's two spellings), no credentials, no fragment.
+    Anything else raises GraphError."""
     if not isinstance(link, str) or not link:
         raise GraphError("@odata.nextLink is not a URL")
     if any(c in link for c in "#\\") or any(c.isspace() or ord(c) < 32 for c in link):
@@ -392,7 +401,7 @@ def _checked_next_link(link) -> str:
         or url.port not in (None, 443)
         or url.userinfo
         or url.fragment
-        or path.lower() != INBOX_MESSAGES_PATH.lower()
+        or path.lower() not in INBOX_NEXT_LINK_PATHS
         or not url.query
     ):
         raise GraphError("@odata.nextLink rejected: not the Graph inbox listing")

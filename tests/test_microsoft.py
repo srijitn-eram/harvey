@@ -26,6 +26,8 @@ class Graph:
         self.drafts = 0
         self.pages = {}         # inbox page number -> httpx.Response, or a dict
                                 # merged into that page's normal JSON body
+        self.link_style = "slash"   # "odata": nextLink says mailFolders('inbox'),
+                                    # as Exchange Online really does
 
     def __call__(self, request: httpx.Request):
         self.requests.append(request)
@@ -58,7 +60,8 @@ class Graph:
             return httpx.Response(200 if method == "PATCH" else 204, json={} if method == "PATCH" else None)
         if path.endswith("/send"):
             return httpx.Response(202)
-        if path == "/v1.0/me/mailFolders/inbox/messages":
+        if path in ("/v1.0/me/mailFolders/inbox/messages",
+                    "/v1.0/me/mailFolders('inbox')/messages"):
             return self._inbox_page(request)
         return httpx.Response(404, json={"error": {"code": "notFound"}})
 
@@ -71,8 +74,10 @@ class Graph:
         page = skip // top + 1
         body = {"value": self.inbox[skip:skip + top]}
         if skip + top < len(self.inbox):
+            folder = ("mailFolders('inbox')/messages" if self.link_style == "odata"
+                      else "mailFolders/inbox/messages")
             body["@odata.nextLink"] = (
-                "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages"
+                f"https://graph.microsoft.com/v1.0/me/{folder}"
                 f"?%24skip={skip + top}&t={top}&%24skiptoken=opaque{page}"
             )
         override = self.pages.get(page)
@@ -85,7 +90,9 @@ class Graph:
                 if r.url.host == "graph.microsoft.com"]
 
     def inbox_requests(self):
-        return [r for r in self.requests if r.url.path.endswith("/inbox/messages")]
+        return [r for r in self.requests
+                if r.url.path.endswith("/inbox/messages")
+                or r.url.path.endswith("('inbox')/messages")]
 
 
 def message(i, sender="someone@elsewhere.example", body="hello"):
@@ -311,6 +318,23 @@ async def test_every_page_of_the_week_is_read(graph):
 
 
 @pytest.mark.asyncio
+async def test_graphs_own_spelling_of_the_inbox_link_is_followed(graph):
+    """Exchange Online's nextLink says mailFolders('inbox'), not
+    mailFolders/inbox. Refusing it held every send for any mailbox with more
+    than one page of mail in the week."""
+    graph.link_style = "odata"
+    graph.inbox = [message(i) for i in range(120)]
+    replies = await provider(graph).get_replies()
+
+    assert [m.provider_id for m in replies] == [f"m{i}" for i in range(120)]
+    first, *later = graph.inbox_requests()
+    assert len(later) == 2
+    assert later[0].url.path == "/v1.0/me/mailFolders('inbox')/messages"
+    assert later[0].url.params["$skip"] == "50"
+    assert "$filter" not in later[0].url.params
+
+
+@pytest.mark.asyncio
 async def test_limit_is_only_the_page_size(graph):
     graph.inbox = [message(i) for i in range(7)]
     replies = await provider(graph).get_replies(limit=3)
@@ -387,9 +411,16 @@ async def test_a_bad_later_page_fails_the_whole_read(graph, override):
     "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages",
     "/v1.0/me/mailFolders/inbox/messages?%24skip=50",
     "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?a=1\r\nX-Evil: 1",
+    "https://graph.microsoft.com/v1.0/me/mailFolders('drafts')/messages?%24skip=50",
+    "https://graph.microsoft.com/v1.0/users('someone')/mailFolders('inbox')/messages?%24skip=50",
+    "https://graph.microsoft.com/v1.0/me/mailFolders('inbox')/messages/m1/send?x=1",
+    "https://graph.microsoft.com/v1.0/me/mailFolders('inbox')/messages",
+    "https://graph.microsoft.com/v1.0/me/mailFolders(%27inbox%27)/messages?x=1",
 ], ids=["http", "off-origin", "suffix-host", "userinfo-host", "credentials", "port",
         "fragment", "empty-fragment", "backslash", "other-path", "send-path",
-        "dot-segments", "encoded-slash", "beta", "no-query", "relative", "crlf"])
+        "dot-segments", "encoded-slash", "beta", "no-query", "relative", "crlf",
+        "odata-other-folder", "odata-other-user", "odata-send-path",
+        "odata-no-query", "odata-encoded-quotes"])
 async def test_hostile_next_link_is_refused_before_any_request(graph, link):
     graph.inbox = [message(i) for i in range(60)]
     graph.pages[1] = {"@odata.nextLink": link}
