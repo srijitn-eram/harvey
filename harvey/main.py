@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import re
 import signal
 import sys
 from datetime import datetime, time, timedelta
@@ -21,6 +22,28 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+
+# Some providers take their API key in the URL query string (Reoon: ?key=...)
+# and httpx logs every request URL at INFO. Mask such values before any
+# handler writes them.
+_SECRET_QUERY = re.compile(r"(?i)\b(api_?key|key|token|access_token|password)=[^&\s'\"]+")
+
+
+class RedactSecrets(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True  # let logging report its own formatting error
+        redacted = _SECRET_QUERY.sub(r"\1=<redacted>", message)
+        if redacted != message:
+            record.msg, record.args = redacted, ()
+        return True
+
+
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(RedactSecrets())
+
 logger = logging.getLogger("harvey")
 
 # Backoff for consecutive failed cycles: 60s, 120s, 240s, ... capped at 15 min
